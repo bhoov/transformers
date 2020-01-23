@@ -26,7 +26,7 @@ from torch.nn import CrossEntropyLoss
 
 from .configuration_gpt2 import GPT2Config
 from .file_utils import add_start_docstrings
-from .modeling_utils import Conv1D, PreTrainedModel, SequenceSummary, prune_conv1d_layer
+from .modeling_utils import Conv1D, PreTrainedModel, SequenceSummary, prune_conv1d_layer, transpose_iterable
 
 
 logger = logging.getLogger(__name__)
@@ -103,6 +103,7 @@ class Attention(nn.Module):
     def __init__(self, nx, n_ctx, config, scale=False):
         super().__init__()
         self.output_attentions = config.output_attentions
+        self.output_additional_info = config.output_additional_info
 
         n_state = nx  # in Attention: n_state=768 (nx=n_embd)
         # [switch nx => n_state from Block to Attention to keep identical to TF implem]
@@ -159,9 +160,16 @@ class Attention(nn.Module):
         if head_mask is not None:
             w = w * head_mask
 
-        outputs = [torch.matmul(w, v)]
+        contexts = torch.matmul(w, v)
+        outputs = [contexts]
         if self.output_attentions:
             outputs.append(w)
+
+            if self.output_additional_info:
+                contexts = contexts.permute(0, 2, 1, 3).contiguous()
+                print("CONTEXTS: ", contexts.shape)
+                outputs.append(contexts)
+
         return outputs
 
     def merge_heads(self, x):
@@ -197,7 +205,7 @@ class Attention(nn.Module):
         a = self.resid_dropout(a)
 
         outputs = [a, present] + attn_outputs[1:]
-        return outputs  # a, present, (attentions)
+        return outputs  # a, present, (attentions), (contexts)
 
 
 class MLP(nn.Module):
@@ -235,7 +243,7 @@ class Block(nn.Module):
         x = x + m
 
         outputs = [x] + output_attn[1:]
-        return outputs  # x, present, (attentions)
+        return outputs  # x, present, (attentions), (?contexts)
 
 
 class GPT2PreTrainedModel(PreTrainedModel):
@@ -358,6 +366,7 @@ class GPT2Model(GPT2PreTrainedModel):
         super().__init__(config)
         self.output_hidden_states = config.output_hidden_states
         self.output_attentions = config.output_attentions
+        self.output_additional_info = config.output_additional_info
         self.output_past = config.output_past
 
         self.wte = nn.Embedding(config.vocab_size, config.n_embd)
@@ -467,6 +476,7 @@ class GPT2Model(GPT2PreTrainedModel):
         presents = ()
         all_attentions = []
         all_hidden_states = ()
+        all_additional_info = ()
         for i, (block, layer_past) in enumerate(zip(self.h, past)):
             if self.output_hidden_states:
                 all_hidden_states = all_hidden_states + (hidden_states.view(*output_shape),)
@@ -481,6 +491,8 @@ class GPT2Model(GPT2PreTrainedModel):
 
             if self.output_attentions:
                 all_attentions.append(outputs[2])
+                if self.output_additional_info:
+                    all_additional_info = all_additional_info + (outputs[3],)
 
         hidden_states = self.ln_f(hidden_states)
 
@@ -499,7 +511,10 @@ class GPT2Model(GPT2PreTrainedModel):
             attention_output_shape = input_shape[:-1] + (-1,) + all_attentions[0].shape[-2:]
             all_attentions = tuple(t.view(*attention_output_shape) for t in all_attentions)
             outputs = outputs + (all_attentions,)
-        return outputs  # last hidden state, (presents), (all hidden_states), (attentions)
+            if self.output_additional_info:
+                outputs = outputs + (all_additional_info,)
+
+        return outputs  # last hidden state, (presents), (all hidden_states), (attentions), (contexts)
 
 
 @add_start_docstrings(

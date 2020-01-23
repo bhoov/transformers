@@ -29,7 +29,7 @@ from torch.nn import CrossEntropyLoss
 
 from .configuration_distilbert import DistilBertConfig
 from .file_utils import add_start_docstrings
-from .modeling_utils import PreTrainedModel, prune_linear_layer
+from .modeling_utils import PreTrainedModel, prune_linear_layer, transpose_iterable
 
 
 logger = logging.getLogger(__name__)
@@ -103,6 +103,7 @@ class MultiHeadSelfAttention(nn.Module):
         self.dim = config.dim
         self.dropout = nn.Dropout(p=config.attention_dropout)
         self.output_attentions = config.output_attentions
+        self.output_additional_info = config.output_additional_info
 
         assert self.dim % self.n_heads == 0
 
@@ -184,13 +185,18 @@ class MultiHeadSelfAttention(nn.Module):
             weights = weights * head_mask
 
         context = torch.matmul(weights, v)  # (bs, n_heads, q_length, dim_per_head)
-        context = unshape(context)  # (bs, q_length, dim)
-        context = self.out_lin(context)  # (bs, q_length, dim)
+        new_context = unshape(context)  # (bs, q_length, dim)
+        new_context = self.out_lin(new_context)  # (bs, q_length, dim)
+
+        output = (new_context,)
 
         if self.output_attentions:
-            return (context, weights)
-        else:
-            return (context,)
+            output += (weights,)
+
+            if self.output_additional_info:
+                output += (context,)
+
+                return output
 
 
 class FFN(nn.Module):
@@ -222,6 +228,7 @@ class TransformerBlock(nn.Module):
         self.dropout = nn.Dropout(p=config.dropout)
         self.activation = config.activation
         self.output_attentions = config.output_attentions
+        self.output_additional_info = config.output_additional_info
 
         assert config.dim % config.n_heads == 0
 
@@ -246,12 +253,14 @@ class TransformerBlock(nn.Module):
             The output of the transformer block contextualization.
         """
         # Self-Attention
-        sa_output = self.attention(query=x, key=x, value=x, mask=attn_mask, head_mask=head_mask)
+        sa_raw_output = self.attention(query=x, key=x, value=x, mask=attn_mask, head_mask=head_mask)
+        assert type(sa_raw_output) == tuple, "Expected output to be a tuple"
+        sa_output = sa_raw_output[0]
         if self.output_attentions:
-            sa_output, sa_weights = sa_output  # (bs, seq_length, dim), (bs, n_heads, seq_length, seq_length)
-        else:  # To handle these `output_attention` or `output_hidden_states` cases returning tuples
-            assert type(sa_output) == tuple
-            sa_output = sa_output[0]
+            sa_weights = sa_raw_output[1]# (bs, seq_length, dim), (bs, n_heads, seq_length, seq_length)
+            if self.output_additional_info:
+                sa_additional_info = sa_raw_output[2]
+
         sa_output = self.sa_layer_norm(sa_output + x)  # (bs, seq_length, dim)
 
         # Feed Forward Network
@@ -259,8 +268,7 @@ class TransformerBlock(nn.Module):
         ffn_output = self.output_layer_norm(ffn_output + sa_output)  # (bs, seq_length, dim)
 
         output = (ffn_output,)
-        if self.output_attentions:
-            output = (sa_weights,) + output
+        output = output + sa_raw_output[1:]
         return output
 
 
@@ -270,6 +278,7 @@ class Transformer(nn.Module):
         self.n_layers = config.n_layers
         self.output_attentions = config.output_attentions
         self.output_hidden_states = config.output_hidden_states
+        self.output_additional_info = config.output_additional_info
 
         layer = TransformerBlock(config)
         self.layer = nn.ModuleList([copy.deepcopy(layer) for _ in range(config.n_layers)])
@@ -296,6 +305,7 @@ class Transformer(nn.Module):
         """
         all_hidden_states = ()
         all_attentions = ()
+        all_additional_info = ()
 
         hidden_state = x
         for i, layer_module in enumerate(self.layer):
@@ -303,24 +313,23 @@ class Transformer(nn.Module):
                 all_hidden_states = all_hidden_states + (hidden_state,)
 
             layer_outputs = layer_module(x=hidden_state, attn_mask=attn_mask, head_mask=head_mask[i])
-            hidden_state = layer_outputs[-1]
+            hidden_state = layer_outputs[0]
 
             if self.output_attentions:
-                assert len(layer_outputs) == 2
-                attentions = layer_outputs[0]
-                all_attentions = all_attentions + (attentions,)
-            else:
-                assert len(layer_outputs) == 1
-
-        # Add last layer
-        if self.output_hidden_states:
-            all_hidden_states = all_hidden_states + (hidden_state,)
+                all_attentions = all_attentions + (layer_outputs[1],)
+                if self.output_additional_info:
+                    all_additional_info = all_additional_info + (layer_outputs[2],)
 
         outputs = (hidden_state,)
         if self.output_hidden_states:
+            # Add last layer
+            all_hidden_states = all_hidden_states + (hidden_state,)
             outputs = outputs + (all_hidden_states,)
+            
         if self.output_attentions:
             outputs = outputs + (all_attentions,)
+            if self.output_additional_info:
+                outputs = outputs + (all_additional_info,)
         return outputs  # last-layer hidden state, (all hidden states), (all attentions)
 
 
@@ -485,7 +494,7 @@ class DistilBertModel(DistilBertPreTrainedModel):
         hidden_state = tfmr_output[0]
         output = (hidden_state,) + tfmr_output[1:]
 
-        return output  # last-layer hidden-state, (all hidden_states), (all attentions)
+        return output  # last-layer hidden-state, (all hidden_states), (all attentions), (all additional info)
 
 
 @add_start_docstrings(
