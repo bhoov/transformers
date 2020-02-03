@@ -18,6 +18,7 @@
 
 import logging
 import os
+from itertools import zip_longest
 
 import torch
 from torch import nn
@@ -1489,3 +1490,10 @@ def prune_layer(layer, index, dim=None):
         return prune_conv1d_layer(layer, index, dim=1 if dim is None else dim)
     else:
         raise ValueError("Can't prune layer of class {}".format(layer.__class__))
+
+def transpose_iterable(ls):
+    """Transpose a list of lists (or tuple of identically lengthed tuples)"""
+    tp = type(ls)
+    if len(ls) > 0: assert type(ls[0]) == tp, f"Expected type {tp}, instead got type {type(ls[0])} inside outer list"
+
+    return tp(map(tp, zip_longest(*ls)))
